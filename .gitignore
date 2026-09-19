@@ -1,0 +1,24 @@
+# 运行时产物（不进 Git，两台实验机本地保留）
+runs/
+logs/
+prep/
+submissions/
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型权重与大数据
+*.pt
+*.pth
+*.ckpt
+*.h5ad
+*.npz
+*.npy
+*.parquet
+*.pkl
+*.pickle
+
+# 环境
+.env
+.venv/
+envs/
