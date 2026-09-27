@@ -416,77 +416,105 @@ def _panel_of(names: np.ndarray) -> np.ndarray:
     global _PANEL_CACHE
     if _PANEL_CACHE is None:
         import pandas as pd
-        from paths import DATA  # noqa: PLC0415
+        from train import DATA
         gp = DATA / "challenge_2026/gene_names.csv"
         genes = pd.read_csv(gp)["gene_name"].astype(str).to_numpy()
         _PANEL_CACHE = {g: i for i, g in enumerate(genes)}
     return np.array([_PANEL_CACHE.get(str(n), -1) for n in names], np.int64)
 
 
-# ---------------------------------------------------------------------- smoke
 
-def smoke(device: str = "cuda") -> None:
-    """Validate this file against two facts we already know the answer to."""
-    import json
+# ----------------------------------------------------------------- H1 validation
 
-    from paths import PREP
-    panel, real, ctrl, meta = load_h1_eval(PREP / "h1_eval.h5", device)
-    print(f"[smoke] H1 panel: {panel.n_pert} perts, {ctrl.shape[0]} control cells, "
-          f"{ctrl.shape[1]} genes, universe={int(panel.de.universe.sum())}")
-    print(f"[smoke] reference median n_sig = "
-          f"{float(panel.real_sig().sum(1).median()):.0f}")
+from train import DATA, PREP, VAL_LINE, batchify, prep_h1_eval
+from loss import CENTER_W, decenter
 
-    # (1) split-half replicate must land in the published r intervals
-    g = torch.Generator(device="cpu").manual_seed(0)
-    halves_a, halves_b = [], []
-    for y in real:
-        idx = torch.randperm(y.shape[0], generator=g).to(y.device)
-        halves_a.append(y[idx[: y.shape[0] // 2]])
-        halves_b.append(y[idx[y.shape[0] // 2 :]])
-    ci = torch.randperm(ctrl.shape[0], generator=g).to(ctrl.device)
-    ref_half = Panel(halves_b, ctrl[ci[: ctrl.shape[0] // 2]],
-                     np.array(panel.own_idx), panel.drop_pds)
-    rep = official_six(halves_a, ref_half)
-    print("\n[smoke] split-half replicate vs published envelope:")
+GEN_SCALE, GEN_TOPK = 0.5, 7000
+
+
+class Validator:
+    """在留出的 H1 上重算官方六项。"""
+
+    def __init__(self, corpus, device: str, seed: int = 0):
+        self.corpus = corpus
+        self.device = device
+        panel, real, ctrl, meta = load_h1_eval(prep_h1_eval(), device)
+        eval_perts = list(meta["perts"])
+        src_perts = set(corpus.lines["gwps"]["perts"])
+        h1 = corpus.lines[VAL_LINE]
+        self.use = [i for i, p in enumerate(eval_perts) if p in src_perts and p in h1["index"]]
+        if not self.use:
+            raise RuntimeError("no H1 evaluation perturbation is covered by the source")
+        self.perts = [eval_perts[i] for i in self.use]
+        sub_real = [real[i] for i in self.use]
+        own = np.array([panel.own_idx[i] for i in self.use], np.int64)
+        self.panel = Panel(sub_real, ctrl, own, panel.drop_pds)
+        self.ctrl = ctrl
+        self.ctrl_mean = self.panel.de.mean.to(torch.float32)
+        self.n_out = sub_real[0].shape[0]
+        w_pos = -np.ones(18533, np.int64)
+        w_pos[corpus.W] = np.arange(corpus.n_w)
+        col = w_pos[meta["panel_idx"].astype(np.int64)]
+        self.eval_in_w = torch.as_tensor(np.where(col >= 0, col, 0), device=device)
+        self.eval_valid = torch.as_tensor(col >= 0, device=device)
+        self.univ_w = torch.as_tensor(
+            corpus.lines[VAL_LINE]["univ"].astype(np.float32), device=device)
+        self.seed = seed
+        self.gen = torch.Generator(device=device).manual_seed(seed)
+        self.n_real = float(self.panel.real_sig().sum(1).to(torch.float64).median())
+        print(f"[val] {len(self.perts)} H1 perturbations, {self.n_out} cells each, "
+              f"{ctrl.shape[1]} eval genes ({int(self.eval_valid.sum())} inside W), "
+              f"reference median n_sig={self.n_real:.0f}", flush=True)
+
+    @torch.no_grad()
+    def predict(self, model):
+        model.eval()
+        lfc, sig = [], []
+        for i in range(0, len(self.perts), 24):
+            chunk = [(p, VAL_LINE) for p in self.perts[i:i + 24]]
+            loc, ctx, esm, sca, pri, uni, _, _, pann, go = batchify(self.corpus, chunk, self.device)
+            a, b, _ = model(loc, ctx, esm, sca, pri, pann, go=go)
+            lfc.append(a)
+            sig.append(b)
+        model.train()
+        return torch.cat(lfc), torch.cat(sig)
+
+    @torch.no_grad()
+    def run(self, model, scale=GEN_SCALE, topk=GEN_TOPK, pre=None, center_w: float = CENTER_W):
+        lfc_w, sig_w = self.predict(model) if pre is None else pre
+        lfc_w = decenter(lfc_w, center_w)
+        self.gen.manual_seed(self.seed)
+        cells = []
+        for i in range(len(self.perts)):
+            v = (lfc_w[i] * self.univ_w)[self.eval_in_w] * self.eval_valid
+            s = torch.where(self.eval_valid, sig_w[i][self.eval_in_w], torch.full_like(v, -1e9))
+            cells.append(synthesize_cells(
+                sparsify(v, s, topk), self.ctrl, self.ctrl_mean, self.n_out, scale, self.gen))
+        raw = official_six(cells, self.panel)
+        n_pred = float(np.mean([
+            int(self.panel.de.table(c)[1].sum()) for c in cells[:min(32, len(cells))]]))
+        return {**{f"raw_{k}": raw[k] for k in KEYS}, **scale(raw),
+                "n_pred": n_pred, "n_real": self.n_real}
+
+
+def main() -> None:
+    import argparse
+    from train import ROOT, TRAIN_LINES, Corpus, tag as default_tag
+
+    ap = argparse.ArgumentParser(description="本地 H1 官方六项")
+    ap.add_argument("--ckpt", default="")
+    ap.add_argument("--gpu", type=int, default=0)
+    args = ap.parse_args()
+    ckpt = Path(args.ckpt) if args.ckpt else ROOT / f"{default_tag}.pt"
+    device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
+    corpus = Corpus(device, TRAIN_LINES)
+    from submit import load_models
+    models = load_models([ckpt], corpus, device)
+    result = Validator(corpus, device, 0).run(models[0])
+    print(f"score_avg = {result['score_avg']:+.6f}")
     for k in KEYS:
-        lo, hi = REPLICATE_ENVELOPE[k]
-        flag = "ok " if lo <= rep[k] <= hi else "OUT"
-        print(f"  {k:6s} local={rep[k]:8.4f}   published=[{lo}, {hi}]  {flag}")
-
-    # (2) rounding a pseudobulk destroys the profile: most genes average below
-    # 0.5 at this depth and round to zero, so the library collapses and the
-    # surviving genes' CPM explodes.  Not what B0 did -- kept as a guard that
-    # the metrics react to a broken submission rather than silently absorbing it.
-    mean_ctrl = ctrl.mean(0)
-    b0 = [mean_ctrl.round().clamp_min(0).expand(y.shape[0], -1).contiguous() for y in real]
-    raw_b0 = official_six(b0, panel)
-    print("\n[smoke] rounded-pseudobulk (degenerate) raw / scaled:")
-    sc = scale(raw_b0)
-    for k in KEYS:
-        print(f"  {k:6s} raw={raw_b0[k]:9.5f}  score={sc['score_' + k]:+.4f}")
-    print(f"  score_avg = {sc['score_avg']:+.4f}")
-
-    # (3) pasting real control cells is what B0_cis06 actually submitted, and
-    # this is the calibration that matters: it must land on the official numbers.
-    ctrl_paste = [ctrl[torch.randperm(ctrl.shape[0], generator=g)[: y.shape[0]].to(ctrl.device)]
-                  for y in real]
-    raw_cp = official_six(ctrl_paste, panel)
-    off = {"pds": 0.5085, "mse": 1.0265, "nmae": 1.0031,
-           "fid": 0.0022, "reach": 0.0737, "jac": 0.0000003}
-    print("\n[smoke] real-control-pasting vs official B0_cis06:")
-    for k in KEYS:
-        print(f"  {k:6s} local={raw_cp[k]:9.5f}   official={off[k]:9.5f}")
-    print(f"  score_avg local={scale(raw_cp)['score_avg']:+.4f}  official=-0.2984")
-    print("  -> B0 scored 0 on fidelity because it called nothing: with the")
-    print("     prediction identical to the control the Wilcoxon test finds no")
-    print("     significant gene, n_pred = 0, and silence is not rewarded while")
-    print("     the official baseline sits at 0.51.  Any submission must produce")
-    print(f"     on the order of {float(panel.real_sig().sum(1).median()):.0f} calls "
-          "to reach coverage 1.")
-
-    (PREP / "smoke_metrics.json").write_text(json.dumps(
-        {"replicate": rep, "b0": raw_b0, "ctrl_paste": raw_cp}, indent=2))
+        print(f"  {k:6s} raw={result['raw_' + k]:.4f}  score={result['score_' + k]:+.4f}")
 
 
 if __name__ == "__main__":
-    smoke()
+    main()
